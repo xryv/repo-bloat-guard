@@ -11,10 +11,15 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          lfs: true
+      - name: Enable Git LFS
+        run: |
+          git lfs install --local
+          git lfs fetch --all || true
       - uses: actions/setup-python@v5
         with:
           python-version: "3.x"
-      - name: Run repo-bloat-guard (Markdown report + enforce)
+      - name: Run repo-bloat-guard (Markdown + LFS + enforce)
         env:
           BG_FAIL_ABS: "1572864"
           BG_FAIL_REL: "12"
@@ -25,7 +30,7 @@ jobs:
           set -e
           BASE_SHA="${{ github.event.pull_request.base.sha || 'origin/main' }}"
           set -o pipefail
-          python bloat_guard.py --ref-base "$BASE_SHA" --fail-on "+1.5MB or +12%" --markdown | tee bloat_report.md
+          python bloat_guard.py --ref-base "$BASE_SHA" --fail-on "+1.5MB or +12%" --markdown --lfs | tee bloat_report.md
           STATUS=${PIPESTATUS[0]}
           echo "status=$STATUS" >> $GITHUB_OUTPUT
           exit $STATUS
