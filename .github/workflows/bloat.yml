@@ -1,1 +1,160 @@
-﻿# (PASTE THE YAML ABOVE EXACTLY)
+﻿name: bloat-guard
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write          # needed to commit the baseline to main
+  pull-requests: write     # needed to label/comment on PRs
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (with history + LFS)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          lfs: true
+
+      - name: Enable Git LFS
+        run: |
+          git lfs install --local
+          git lfs fetch --all || true
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      # Prepare a baseline.json:
+      # - On PR: try to read baseline file from the PR's base commit (.bloatbaseline.json).
+      # - On push: if a baseline exists in repo, use it; otherwise proceed without.
+      - name: Prepare baseline file
+        id: prep_baseline
+        shell: bash
+        run: |
+          set -e
+          BASE_SHA="${{ github.event.pull_request.base.sha || 'origin/main' }}"
+          if [ -n "${{ github.event.pull_request.number }}" ]; then
+            # Pull baseline from the base commit of this PR, if present
+            git show "$BASE_SHA:.bloatbaseline.json" > baseline.json 2>/dev/null || true
+          else
+            # Push: if repo has baseline on this branch, use it
+            if [ -f .bloatbaseline.json ]; then
+              cp .bloatbaseline.json baseline.json
+            fi
+          fi
+          if [ -f baseline.json ]; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run repo-bloat-guard (Markdown + LFS + baseline load + snapshot write)
+        id: run_guard
+        env:
+          BG_FAIL_ABS: "1572864"   # 1.5 MB
+          BG_FAIL_REL: "12"        # 12 %
+          BG_EXCLUDE: "**/*.map,**/*.lock,**/node_modules/**"
+          BG_BUDGETS_FILE: ".bloatbudgets.json"
+        shell: bash
+        run: |
+          set +e
+          BASE_SHA="${{ github.event.pull_request.base.sha || 'origin/main' }}"
+          # If we have a baseline.json from previous step, pass it; otherwise the tool will say "No baseline provided."
+          BASELINE_ARG=""
+          if [ -f baseline.json ]; then
+            BASELINE_ARG="--baseline-json baseline.json"
+          fi
+
+          # Always write the current snapshot (largest HEAD files) for this run
+          python bloat_guard.py \
+            --ref-base "$BASE_SHA" \
+            --fail-on "+1.5MB or +12%" \
+            --markdown --lfs \
+            $BASELINE_ARG \
+            --snapshot-json current_head_big.json \
+            | tee bloat_report.md
+
+          STATUS=${PIPESTATUS[0]}
+          echo "status=$STATUS" >> "$GITHUB_OUTPUT"
+          # Don't fail yet—let next steps upload, comment, label, then we fail explicitly
+          exit 0
+
+      - name: Upload bloat report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bloat-report
+          path: bloat_report.md
+
+      - name: Comment bloat report on PR
+        if: ${{ github.event.pull_request.number != '' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          # Post the Markdown report as a PR comment
+          body=$(jq -Rs . < bloat_report.md)
+          curl -s -X POST \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO}/issues/${PR_NUMBER}/comments" \
+            -d "{\"body\": ${body}}"
+
+      - name: Ensure 'bloat-detected' label exists (only when failing)
+        if: ${{ github.event.pull_request.number != '' && steps.run_guard.outputs.status != '0' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          # Try to create the label (ignore if it already exists)
+          curl -s -X POST \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO}/labels" \
+            -d '{"name":"bloat-detected","color":"d93f0b","description":"Repo bloat detected by CI"}' >/dev/null 2>&1 || true
+
+      - name: Add 'bloat-detected' label to PR (on failure)
+        if: ${{ github.event.pull_request.number != '' && steps.run_guard.outputs.status != '0' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          curl -s -X POST \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO}/issues/${PR_NUMBER}/labels" \
+            -d '{"labels":["bloat-detected"]}'
+
+      - name: Fail if bloat detected
+        if: ${{ steps.run_guard.outputs.status != '0' }}
+        run: exit 1
+
+      - name: Persist baseline on main (commit .bloatbaseline.json)
+        if: ${{ github.ref == 'refs/heads/main' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -e
+          # Copy the snapshot from this run as the canonical baseline file
+          cp current_head_big.json .bloatbaseline.json
+
+          if git diff --quiet -- .bloatbaseline.json; then
+            echo "Baseline unchanged; no commit."
+            exit 0
+          fi
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .bloatbaseline.json
+          git commit -m "chore(bloat): update baseline snapshot"
+          git push
