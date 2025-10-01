@@ -1,1 +1,1 @@
-﻿# (paste the FULL updated bloat_guard.py content above)
+﻿# (PASTE the FULL updated bloat_guard.py content from above)
