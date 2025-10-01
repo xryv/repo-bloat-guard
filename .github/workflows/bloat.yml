@@ -61,15 +61,15 @@ jobs:
           BG_BUDGETS_FILE: ".bloatbudgets.json"
         shell: bash
         run: |
-          set +e
+          # We want correct exit code from "python | tee" and still continue the job
+          set -o pipefail
           BASE_SHA="${{ github.event.pull_request.base.sha || 'origin/main' }}"
-          # If we have a baseline.json from previous step, pass it; otherwise the tool will say "No baseline provided."
+
           BASELINE_ARG=""
           if [ -f baseline.json ]; then
             BASELINE_ARG="--baseline-json baseline.json"
           fi
 
-          # Always write the current snapshot (largest HEAD files) for this run
           python bloat_guard.py \
             --ref-base "$BASE_SHA" \
             --fail-on "+1.5MB or +12%" \
@@ -80,8 +80,17 @@ jobs:
 
           STATUS=${PIPESTATUS[0]}
           echo "status=$STATUS" >> "$GITHUB_OUTPUT"
-          # Don't fail yet—let next steps upload, comment, label, then we fail explicitly
+
+          # Sanity: report whether snapshot exists
+          if [ -f current_head_big.json ]; then
+            echo "Snapshot created: current_head_big.json"
+          else
+            echo "::warning:: bloat_guard.py did not produce current_head_big.json"
+          fi
+
+          # Do NOT exit non-zero here; later steps may comment/label, then we fail explicitly if needed
           exit 0
+
 
       - name: Upload bloat report artifact
         if: always()
@@ -145,6 +154,12 @@ jobs:
         shell: bash
         run: |
           set -e
+          # If no snapshot was produced, skip gracefully
+          if [ ! -f current_head_big.json ]; then
+            echo "No snapshot (current_head_big.json) found; skipping baseline update."
+            exit 0
+          fi
+
           # Copy the snapshot from this run as the canonical baseline file
           cp current_head_big.json .bloatbaseline.json
 
