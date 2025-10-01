@@ -1,0 +1,30 @@
+name: bloat-guard
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # we need history for base refs
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Run repo-bloat-guard
+        env:
+          BG_FAIL_ABS: "1572864"   # 1.5 MB in bytes (absolute threshold)
+          BG_FAIL_REL: "12"        # 12% relative threshold
+          BG_INCLUDE: ""           # e.g., "src/**,assets/**"
+          BG_EXCLUDE: "**/*.map,**/*.lock,**/node_modules/**"
+        run: |
+          echo "Base SHA (if PR): ${{ github.event.pull_request.base.sha }}"
+          BASE_SHA="${{ github.event.pull_request.base.sha || '' }}"
+          if [ -z "$BASE_SHA" ]; then
+            BASE_SHA="origin/main"
+          fi
+          python bloat_guard.py --ref-base "$BASE_SHA" --fail-on "+1.5MB or +12%"
