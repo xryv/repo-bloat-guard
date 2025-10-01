@@ -13,6 +13,7 @@ Features:
 - Git LFS-aware mode (resolve true HEAD sizes where possible)
 - Largest files over time: compare against a baseline JSON and write current snapshot
 - Plain text, Markdown, and JSON outputs
+- BOM-safe JSON loading (handles UTF-8 with BOM from Windows PowerShell)
 - Zero external Python deps
 
 Exit codes:
@@ -32,9 +33,6 @@ import subprocess
 import sys
 from typing import Dict, Tuple, List, Optional
 
-# -------------------------------
-# Constants / suspicious types
-# -------------------------------
 DEC_KB = 1000
 DEC_MB = 1000 * 1000
 
@@ -50,7 +48,7 @@ SUSPICIOUS_EXTS = {
 }
 
 # -------------------------------
-# Process helpers
+# Subprocess helper
 # -------------------------------
 def run(cmd: List[str], cwd: Optional[str] = None) -> Tuple[int, str, str]:
     proc = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -94,7 +92,7 @@ def parse_fail_on(expr: Optional[str]) -> Tuple[Optional[int], Optional[float]]:
 
 # -------------------------------
 # git ls-tree parsing (robust)
-# format: "<mode> <type> <object> <size>\t<path>"
+# "<mode> <type> <object> <size>\t<path>"
 # -------------------------------
 def parse_ls_tree_entry(entry: str) -> Optional[Tuple[str, int]]:
     if not entry:
@@ -175,7 +173,7 @@ def new_and_deleted(base: Dict[str, int], head: Dict[str, int]) -> Tuple[List[Tu
     return new_files, deleted_files
 
 # -------------------------------
-# Threshold evaluation
+# Thresholds / budgets
 # -------------------------------
 def exceeds_global(delta: int, base_total: int, abs_bytes: Optional[int], rel_pct: Optional[float]) -> Tuple[bool, str]:
     msgs = []
@@ -191,20 +189,26 @@ def exceeds_global(delta: int, base_total: int, abs_bytes: Optional[int], rel_pc
         msgs.append("No global thresholds configured.")
     return hit, " | ".join(msgs)
 
-# -------------------------------
-# Budgets
-# -------------------------------
 class Budget:
     def __init__(self, pattern: str, max_total_bytes: Optional[int], max_delta_bytes: Optional[int]):
         self.pattern = pattern
         self.max_total_bytes = max_total_bytes
         self.max_delta_bytes = max_delta_bytes
 
+# -------- BOM-safe JSON helpers (fixes UTF-8 BOM from PowerShell) --------
+def _read_json_bom_safe(path: str) -> dict:
+    # First, try utf-8-sig (strips BOM). If that fails, try plain utf-8.
+    try:
+        with open(path, "r", encoding="utf-8-sig") as f:
+            return json.load(f)
+    except Exception:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+
 def load_budgets(path: Optional[str]) -> List[Budget]:
     if not path or not os.path.isfile(path):
         return []
-    with open(path, "r", encoding="utf-8") as f:
-        raw = json.load(f)
+    raw = _read_json_bom_safe(path)
     budgets: List[Budget] = []
     for item in raw:
         pat = item.get("pattern") or ""
@@ -253,16 +257,10 @@ def suspicious_increases(deltas: Dict[str, int], exts: set, limit: int = 15) -> 
 # Git LFS true-size resolution (HEAD only)
 # -------------------------------
 def lfs_resolve_head_sizes(head_sizes: Dict[str, int]) -> Tuple[Dict[str, int], str]:
-    """
-    Attempts to resolve true sizes for HEAD LFS files.
-    Returns (possibly adjusted head_sizes, note_message).
-    If git-lfs not available or parsing fails, returns original sizes with a note.
-    """
     code, _, _ = run(["git", "lfs", "version"])
     if code != 0:
         return head_sizes, "LFS: git-lfs not available; using pointer sizes."
-
-    code, out, err = run(["git", "lfs", "ls-files", "-l"])  # long format
+    code, out, err = run(["git", "lfs", "ls-files", "-l"])
     if code != 0:
         return head_sizes, f"LFS: ls-files failed; using pointer sizes. ({err.strip()})"
 
@@ -271,7 +269,6 @@ def lfs_resolve_head_sizes(head_sizes: Dict[str, int]) -> Tuple[Dict[str, int], 
         line = line.strip()
         if not line:
             continue
-        # Parse "... size <BYTES> <path>"
         m = re.search(r'\bsize\s+([0-9]+)\b', line)
         if not m:
             continue
@@ -307,19 +304,16 @@ def from_biglist_dict(d: Dict[str, int]) -> List[Tuple[str, int]]:
 def load_baseline(path: Optional[str]) -> Optional[Dict[str,int]]:
     if not path or not os.path.isfile(path):
         return None
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+    return _read_json_bom_safe(path)
 
 def save_snapshot(path: Optional[str], head_big: List[Tuple[str,int]]) -> None:
     if not path:
         return
+    # Write without BOM
     with open(path, "w", encoding="utf-8") as f:
         json.dump(to_biglist_dict(head_big), f, indent=2)
 
 def compare_biglists(prev: Dict[str,int], curr: Dict[str,int], limit:int=20) -> List[Tuple[str,int,int]]:
-    """
-    Returns list of (path, prev_size, curr_size) sorted by curr_size desc.
-    """
     keys = set(prev.keys()) | set(curr.keys())
     rows = []
     for k in keys:
@@ -423,7 +417,6 @@ def render_markdown(ref_base: str,
         lines.append("|---|---:|")
         for p, s in head_big:
             lines.append(f"| `{p}` | {human_bytes(s)} |")
-    # What changed
     if new_files or del_files:
         lines.append("")
         lines.append("**What changed**")
@@ -445,7 +438,6 @@ def render_markdown(ref_base: str,
             for p, s in del_files:
                 lines.append(f"| `{p}` | {human_bytes(s)} |")
             lines.append("</details>")
-    # History
     if history_rows:
         lines.append("")
         lines.append("**Largest files over time** (vs baseline)")
@@ -476,7 +468,6 @@ def main() -> int:
         include = parse_glob_csv(args.include)
         exclude = parse_glob_csv(args.exclude)
 
-        # thresholds
         abs_bytes: Optional[int] = None
         rel_pct: Optional[float] = None
         if args.fail_on:
@@ -491,12 +482,10 @@ def main() -> int:
                 try: rel_pct = float(env_rel)
                 except Exception: raise ValueError(f"BG_FAIL_REL must be a number (percent), got {env_rel!r}")
 
-        # git ok?
         code, out, err = run(["git", "--version"])
         if code != 0:
             raise RuntimeError(f"git not available: {err.strip() or out.strip()}")
 
-        # resolve refs
         code, _, _ = run(["git", "rev-parse", "--verify", ref_base])
         if code != 0:
             if "/" in ref_base:
@@ -510,11 +499,9 @@ def main() -> int:
         if code != 0:
             raise RuntimeError(f"Cannot resolve head ref {ref_head!r}: {err.strip()}")
 
-        # sizes
         base_sizes = ls_tree_sizes(ref_base, include, exclude)
         head_sizes = ls_tree_sizes(ref_head, include, exclude)
 
-        # Optional: LFS adjust true sizes for HEAD (only)
         lfs_note = None
         if args.lfs and ref_head == "HEAD":
             head_sizes, lfs_note = lfs_resolve_head_sizes(head_sizes)
@@ -523,18 +510,15 @@ def main() -> int:
         base_total, head_total, delta = compute_totals(base_sizes, head_sizes)
         rel_delta_pct = (delta / base_total * 100.0) if base_total > 0 else (100.0 if delta > 0 else 0.0)
 
-        # global thresholds
         global_hit, global_msg = False, "No global thresholds configured."
         if abs_bytes is not None or rel_pct is not None:
             global_hit, global_msg = exceeds_global(delta, base_total, abs_bytes, rel_pct)
 
-        # budgets
         budgets = load_budgets(args.budgets_file)
         budget_hit, budget_msgs = False, []
         if budgets:
             budget_hit, budget_msgs = check_budgets(budgets, head_sizes, deltas)
 
-        # suspicious / biggest / changed
         top_inc = top_positive_deltas(deltas, limit=args.top_increases)
         sus = suspicious_increases(deltas, SUSPICIOUS_EXTS, limit=15)
         head_big = biggest_files(head_sizes, limit=args.top_head)
@@ -542,10 +526,8 @@ def main() -> int:
         new_files = new_files[:args.top_new]
         del_files = del_files[:args.top_deleted]
 
-        # Save snapshot (largest files at HEAD)
+        # Snap + baseline (BOM-tolerant)
         save_snapshot(args.snapshot_json, head_big)
-
-        # Baseline compare (largest files over time)
         history_rows: List[Tuple[str,int,int]] = []
         baseline_note = None
         base_dict = load_baseline(args.baseline_json)
@@ -558,7 +540,6 @@ def main() -> int:
             else:
                 baseline_note = "No baseline file provided."
 
-        # output
         if args.markdown:
             md = render_markdown(ref_base, ref_head, include, exclude,
                                  base_total, head_total, delta, rel_delta_pct,
